@@ -1,11 +1,19 @@
 package aoai.demos.functions;
 
+import com.azure.ai.openai.OpenAIClient;
 import com.azure.ai.openai.OpenAIClientBuilder;
 import com.azure.ai.openai.models.*;
 import com.azure.core.credential.AzureKeyCredential;
 import com.azure.core.util.BinaryData;
+import com.azure.core.util.Context;
+import com.azure.search.documents.indexes.SearchIndexClient;
+import com.azure.search.documents.indexes.SearchIndexClientBuilder;
+import com.azure.search.documents.models.*;
+import com.azure.search.documents.util.SearchPagedIterable;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.github.cdimascio.dotenv.Dotenv;
 
+import javax.swing.*;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.UncheckedIOException;
@@ -15,6 +23,7 @@ import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.util.*;
 
 public class ChatAppWithFunctions {
@@ -22,20 +31,33 @@ public class ChatAppWithFunctions {
     public static final String BASE_URL = "https://swapi.dev/api/";
     public static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
     public static final String STAR_WARS_API_FUNCTION_CALL_NAME = "call_starwars_api";
+    public static final String STAR_WARS_VEHICLE_SEARCH_FUNCTION_CALL_NAME = "call_vehicle_search";
+
+    public static SearchIndexClient searchIndexClient;
+    public static OpenAIClient openAIClient;
 
     public static void main(String[] args) {
 
-        var azureOpenaiKey = "your api key";
-        var endpoint = "https://  --- .openai.azure.com/";
+        var dotenv = Dotenv.load();
+        var endpoint = dotenv.get("OPENAI_ENDPOINT");
+        var azureOpenaiKey = dotenv.get("OPENAI_KEY");
         var deploymentOrModelId = "gpt-35-turbo";
 
-        var client = new OpenAIClientBuilder()
+        openAIClient = new OpenAIClientBuilder()
                 .endpoint(endpoint)
                 .credential(new AzureKeyCredential(azureOpenaiKey))
                 .buildClient();
 
+        var azureSearchEndpoint = dotenv.get("AZURE_SEARCH_ENDPOINT");
+        var azureSearchKey = dotenv.get("AZURE_SEARCH_KEY");
+
+        searchIndexClient = new SearchIndexClientBuilder()
+                .endpoint(azureSearchEndpoint)
+                .credential(new AzureKeyCredential(azureSearchKey))
+                .buildClient();
+
         var systemMessage = new ChatMessage(ChatRole.SYSTEM,
-                "You are a helpful assistant that helps find information about starships in Star Wars.");
+                "You are a helpful assistant that helps find information about starships and vehicles in Star Wars.");
 
         List<ChatMessage> chatHistoryMessages = new ArrayList<>();
 
@@ -48,6 +70,12 @@ public class ChatAppWithFunctions {
 
             if (consoleLine.equals("/q")) {
                 break;
+            }
+            if (consoleLine.equals("/clear")) {
+                chatHistoryMessages.clear();
+                System.out.println("Cleared history");
+                System.out.print("You: ");
+                continue;
             }
 
             List<ChatMessage> chatInputMessages = new ArrayList<>();
@@ -66,16 +94,19 @@ public class ChatAppWithFunctions {
                 add(new FunctionDefinition(STAR_WARS_API_FUNCTION_CALL_NAME)
                         .setDescription("Gets Star Wars starship information.")
                         .setParameters(getCallStarWarsApiFunctionDefinition()));
+                add(new FunctionDefinition(STAR_WARS_VEHICLE_SEARCH_FUNCTION_CALL_NAME)
+                        .setDescription("Searches for a vehicle in Star Wars.")
+                        .setParameters(getSearchVehicleFunctionDefinition()));
             }});
 
-            ChatCompletions chatCompletions = client.getChatCompletions(deploymentOrModelId, options);
-
-            var response = handleFunctionCallResponse(chatCompletions.getChoices(), chatInputMessages);
+            ChatCompletions chatCompletions = openAIClient.getChatCompletions(deploymentOrModelId, options);
+            var functionCallingHistory = new ArrayList<ChatMessage>();
+            var response = handleFunctionCallResponse(chatCompletions.getChoices(), chatInputMessages, functionCallingHistory);
 
             if (response.function_call()) {
                 chatInputMessages = response.messages();
-                chatCompletions = client.getChatCompletions(deploymentOrModelId, new ChatCompletionsOptions(chatInputMessages));
-                response = handleFunctionCallResponse(chatCompletions.getChoices(), chatInputMessages);
+                chatCompletions = openAIClient.getChatCompletions(deploymentOrModelId, new ChatCompletionsOptions(chatInputMessages));
+                response = handleFunctionCallResponse(chatCompletions.getChoices(), chatInputMessages, functionCallingHistory);
             }
 
             for (var message : response.messages()) {
@@ -90,6 +121,7 @@ public class ChatAppWithFunctions {
                         usage.getPromptTokens(), usage.getCompletionTokens(), usage.getTotalTokens());
 
                 // Add history to keep context
+                chatHistoryMessages.addAll(functionCallingHistory);
                 chatHistoryMessages.add(question);
                 chatHistoryMessages.add(new ChatMessage(ChatRole.ASSISTANT, assistantResponse));
 
@@ -99,6 +131,119 @@ public class ChatAppWithFunctions {
         }
     }
 
+
+    private static FunctionCallResponse handleFunctionCallResponse(List<ChatChoice> choices, List<ChatMessage> chatInputMessages, List<ChatMessage> functionCallingHistory) {
+
+        boolean functionCallWasMade = false;
+        List<ChatMessage> messages = new ArrayList<>();
+
+        for (ChatChoice choice : choices) {
+            ChatMessage choiceMessage = choice.getMessage();
+
+            if (CompletionsFinishReason.FUNCTION_CALL.equals(choice.getFinishReason())) {
+                FunctionCall functionCall = choiceMessage.getFunctionCall();
+                System.out.printf("Function name: %s, arguments: %s.%n", functionCall.getName(), functionCall.getArguments());
+
+                if (functionCall.getName().equals(STAR_WARS_API_FUNCTION_CALL_NAME)) {
+                    var functionCallResponseMessage = CallSwapiApi(functionCall);
+                    chatInputMessages.add(functionCallResponseMessage);
+                    functionCallingHistory.add(functionCallResponseMessage);
+                    functionCallWasMade = true;
+                }
+
+                if (functionCall.getName().equals(STAR_WARS_VEHICLE_SEARCH_FUNCTION_CALL_NAME)) {
+                    var functionCallResponseMessage = SearchVehicle(functionCall);
+                    chatInputMessages.add(functionCallResponseMessage);
+                    functionCallingHistory.add(functionCallResponseMessage);
+                    functionCallWasMade = true;
+                }
+            } else {
+                messages.add(choiceMessage);
+            }
+        }
+
+        if (functionCallWasMade) {
+            return new FunctionCallResponse(functionCallWasMade, chatInputMessages);
+        } else {
+            return new FunctionCallResponse(functionCallWasMade, messages);
+        }
+    }
+
+    private static ChatMessage SearchVehicle(FunctionCall functionCall) {
+        VehicleSearchFunctionCallingInput input = BinaryData.fromString(functionCall.getArguments()).toObject(VehicleSearchFunctionCallingInput.class);
+
+        var searchQuery = input.search_query();
+        var searchClient = searchIndexClient.getSearchClient("swapi-vehicle-index");
+
+        var embeddingsResult = openAIClient.getEmbeddings("text-embedding-ada-002", new EmbeddingsOptions(new ArrayList<>() {{
+            add(searchQuery);
+        }}));
+
+        List<Float> vectorizedResult = embeddingsResult.getData().get(0).getEmbedding().stream().map(Double::floatValue).toList();
+        VectorQuery vectorQuery = new VectorizedQuery(vectorizedResult)
+                .setKNearestNeighborsCount(3)
+                .setFields("summary_vector");
+
+        // Hybrid search with vector and semantic search
+        SearchPagedIterable searchResults = searchClient.search(
+                searchQuery,
+                new SearchOptions()
+                        .setQueryType(QueryType.SEMANTIC)
+                        .setTop(3)
+                        .setVectorSearchOptions(new VectorSearchOptions()
+                                .setQueries(vectorQuery))
+                        .setSemanticSearchOptions(new SemanticSearchOptions()
+                                .setSemanticConfigurationName("default")
+                                .setQueryAnswer(new QueryAnswer(QueryAnswerType.EXTRACTIVE))
+                                .setQueryCaption(new QueryCaption(QueryCaptionType.EXTRACTIVE))
+                                .setErrorMode(SemanticErrorMode.PARTIAL)
+                                .setMaxWaitDuration(Duration.ofSeconds(5))),
+                Context.NONE);
+
+        var stringBuilder = new StringBuilder();
+        int count = 0;
+        for (var searchResult : searchResults) {
+            count++;
+
+            VehicleSearchResult result = searchResult.getDocument(VehicleSearchResult.class);
+            System.out.println("Search result " + count + " : " + result.summary());
+            stringBuilder.append(result.summary()).append("\n");
+        }
+        System.out.println("Total number of search results: " + count);
+
+        return new ChatMessage(ChatRole.FUNCTION, stringBuilder.toString())
+                .setName(STAR_WARS_VEHICLE_SEARCH_FUNCTION_CALL_NAME);
+    }
+
+    private static ChatMessage CallSwapiApi(FunctionCall functionCall) {
+        SwapiApiFunctionCallingInput input = BinaryData.fromString(functionCall.getArguments()).toObject(SwapiApiFunctionCallingInput.class);
+
+        try {
+            HttpClient httpClient = HttpClient.newHttpClient();
+            HttpRequest request = HttpRequest
+                    .newBuilder(URI.create(BASE_URL + "starships?search=" + URLEncoder.encode(input.ship_name(), StandardCharsets.UTF_8)))
+                    .GET()
+                    .setHeader("Content-Type", "application/json")
+                    .build();
+
+            HttpResponse<InputStream> response = httpClient.send(request, HttpResponse.BodyHandlers.ofInputStream());
+
+            SwapiResponse swapiResponse = toObject(response.body());
+            String shipResponse;
+            if (swapiResponse.count == 0) {
+                shipResponse = "No starship found.";
+                System.out.println("No starship found.");
+            } else {
+                shipResponse = ToGptReadable(swapiResponse.results().get(0));
+            }
+
+            return new ChatMessage(ChatRole.FUNCTION, shipResponse)
+                    .setName(STAR_WARS_API_FUNCTION_CALL_NAME);
+
+        } catch (IOException | InterruptedException e) {
+            throw new RuntimeException(e);
+        }
+    }
 
     private static Map<String, Object> getCallStarWarsApiFunctionDefinition() {
         // Construct JSON in Map, or you can use create your own customized model.
@@ -114,65 +259,31 @@ public class ChatAppWithFunctions {
         return functionDefinition;
     }
 
-    private static FunctionCallResponse handleFunctionCallResponse(List<ChatChoice> choices, List<ChatMessage> chatInputMessages) {
 
-        boolean functionCallNeeded = false;
-        List<ChatMessage> messages = new ArrayList<>();
-
-        for (ChatChoice choice : choices) {
-            ChatMessage choiceMessage = choice.getMessage();
-            FunctionCall functionCall = choiceMessage.getFunctionCall();
-
-            if (CompletionsFinishReason.FUNCTION_CALL.equals(choice.getFinishReason())) {
-                System.out.printf("Function name: %s, arguments: %s.%n", functionCall.getName(), functionCall.getArguments());
-
-                if (functionCall.getName().equals(STAR_WARS_API_FUNCTION_CALL_NAME)) {
-                    SwapiFunctionCallingInput input = BinaryData.fromString(functionCall.getArguments()).toObject(SwapiFunctionCallingInput.class);
-
-                    try {
-                        HttpClient httpClient = HttpClient.newHttpClient();
-                        HttpRequest request = HttpRequest
-                                .newBuilder(URI.create(BASE_URL + "starships?search=" + URLEncoder.encode(input.ship_name(), StandardCharsets.UTF_8)))
-                                .GET()
-                                .setHeader("Content-Type", "application/json")
-                                .build();
-
-                        HttpResponse<InputStream> response = httpClient.send(request, HttpResponse.BodyHandlers.ofInputStream());
-
-                        SwapiResponse swapiResponse = toObject(response.body());
-                        String shipResponse;
-                        if (swapiResponse.count == 0) {
-                            shipResponse = "No starship found.";
-                            System.out.println("No starship found.");
-                        }
-                        else {
-                            shipResponse = ToGptReadable(swapiResponse.results().get(0));
-                        }
-
-                        var functionCallMessage = new ChatMessage(ChatRole.FUNCTION, shipResponse)
-                                .setName(STAR_WARS_API_FUNCTION_CALL_NAME);
-                        chatInputMessages.add(functionCallMessage);
-                        functionCallNeeded = true;
-
-                    } catch (IOException | InterruptedException e) {
-                        throw new RuntimeException(e);
-                    }
-                }
-            }
-            else {
-                messages.add(choiceMessage);
-            }
-
-        }
-        if (functionCallNeeded) {
-            return new FunctionCallResponse(functionCallNeeded, chatInputMessages);
-        }
-        else {
-            return new FunctionCallResponse(functionCallNeeded, messages);
-        }
+    private static Map<String, Object> getSearchVehicleFunctionDefinition() {
+        // Construct JSON in Map, or you can use create your own customized model.
+        Map<String, Object> searchQuery = new HashMap<>();
+        searchQuery.put("type", "string");
+        searchQuery.put("description", "The search query");
+        Map<String, Object> properties = new HashMap<>();
+        properties.put("search_query", searchQuery);
+        Map<String, Object> functionDefinition = new HashMap<>();
+        functionDefinition.put("type", "object");
+        functionDefinition.put("required", List.of("search_query"));
+        functionDefinition.put("properties", properties);
+        return functionDefinition;
     }
 
+
     private record FunctionCallResponse(boolean function_call, List<ChatMessage> messages) {
+    }
+
+    private record VehicleSearchResult(
+            String title,
+            String summary,
+            String model,
+            String manufacturer
+    ) {
     }
 
     private static String ToGptReadable(SwapiResponse.StarShip starShip) {
@@ -202,7 +313,11 @@ public class ChatAppWithFunctions {
         }
     }
 
-    public static record SwapiFunctionCallingInput(
+    public record VehicleSearchFunctionCallingInput(
+            String search_query) {
+    }
+
+    public record SwapiApiFunctionCallingInput(
             String ship_name) {
     }
 

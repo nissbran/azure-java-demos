@@ -3,6 +3,7 @@ package aoai.demos.completion;
 import com.azure.ai.openai.OpenAIClientBuilder;
 import com.azure.ai.openai.models.*;
 import com.azure.core.credential.AzureKeyCredential;
+import io.github.cdimascio.dotenv.Dotenv;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -12,8 +13,9 @@ public class CompletionApp {
 
     public static void main(String[] args) {
 
-        var azureOpenaiKey = "your api key";
-        var endpoint = "https://  --- .openai.azure.com/";
+        var dotenv = Dotenv.load();
+        var azureOpenaiKey = dotenv.get("OPENAI_KEY");
+        var endpoint = dotenv.get("OPENAI_ENDPOINT");
         var deploymentOrModelId = "instruct";
 
         var client = new OpenAIClientBuilder()

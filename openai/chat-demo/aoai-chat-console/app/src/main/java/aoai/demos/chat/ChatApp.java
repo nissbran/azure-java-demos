@@ -3,6 +3,7 @@ package aoai.demos.chat;
 import com.azure.ai.openai.OpenAIClientBuilder;
 import com.azure.ai.openai.models.*;
 import com.azure.core.credential.AzureKeyCredential;
+import io.github.cdimascio.dotenv.Dotenv;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -12,8 +13,9 @@ public class ChatApp {
 
     public static void main(String[] args) {
 
-        var azureOpenaiKey = "your api key";
-        var endpoint = "https://  --- .openai.azure.com/";
+        var dotenv = Dotenv.load();
+        var azureOpenaiKey = dotenv.get("OPENAI_KEY");
+        var endpoint = dotenv.get("OPENAI_ENDPOINT");
         var deploymentOrModelId = "gpt-35-turbo";
 
         var client = new OpenAIClientBuilder()
@@ -34,6 +36,12 @@ public class ChatApp {
 
             if (consoleLine.equals("/q")) {
                 break;
+            }
+            if (consoleLine.equals("/clear")) {
+                chatHistoryMessages.clear();
+                System.out.println("Cleared history");
+                System.out.print("You: ");
+                continue;
             }
 
             List<ChatMessage> chatInputMessages = new ArrayList<>();
